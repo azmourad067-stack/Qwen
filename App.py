@@ -580,10 +580,17 @@ def save_prediction_history(df_ranked, url, prediction_date):
         with open(history_file, 'rb') as f:
             history = pickle.load(f)
     
+    # Sélectionner les colonnes qui existent
+    cols_to_save = ['Nom', 'score_final']
+    if 'ml_prob_top3' in df_ranked.columns:
+        cols_to_save.append('ml_prob_top3')
+    if 'dl_prob_top3' in df_ranked.columns:
+        cols_to_save.append('dl_prob_top3')
+    
     prediction_data = {
         'url': url,
         'date': prediction_date,
-        'predictions': df_ranked[['Nom', 'score_final', 'ml_prob_top3', 'dl_prob_top3']].to_dict('records')
+        'predictions': df_ranked[cols_to_save].to_dict('records')
     }
     
     history.append(prediction_data)
@@ -784,8 +791,8 @@ def generate_adaptive_report(df_ranked, race_type, config):
         if cheval['score_form'] > 1.0: reasons.append("forme excellente")
         elif cheval['score_form'] > 0.0: reasons.append("bonne forme récente")
         if cheval['score_interactions'] > 0: reasons.append("bonus interactions")
-        if 'ml_prob_top3' in cheval: reasons.append(f"proba ML: {cheval['ml_prob_top3']*100:.0f}%")
-        if 'dl_prob_top3' in cheval: reasons.append(f"proba DL: {cheval['dl_prob_top3']*100:.0f}%")
+        if 'ml_prob_top3' in cheval and not pd.isna(cheval['ml_prob_top3']): reasons.append(f"proba ML: {cheval['ml_prob_top3']*100:.0f}%")
+        if 'dl_prob_top3' in cheval and not pd.isna(cheval['dl_prob_top3']): reasons.append(f"proba DL: {cheval['dl_prob_top3']*100:.0f}%")
         report.append(f"   {i+1}. {cheval['Nom']} → {', '.join(reasons) or 'profil équilibré'}")
     
     return "\n".join(report)
@@ -895,8 +902,10 @@ def main():
         # Tableau des résultats
         st.subheader("🏆 Pronostics")
         df_display = df_ranked[['rang', 'Nom', 'Numéro de corde', 'Cote', 'score_final']].copy()
+
         if 'ml_prob_top3' in df_ranked.columns:
             df_display['Proba ML'] = (df_ranked['ml_prob_top3'] * 100).round(1).astype(str) + '%'
+
         if 'dl_prob_top3' in df_ranked.columns:
             df_display['Proba DL'] = (df_ranked['dl_prob_top3'] * 100).round(1).astype(str) + '%'
         
