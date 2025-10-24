@@ -1,10 +1,11 @@
 streamlit
+pandas
+numpy
 requests
 beautifulsoup4
-pandas
+plotly
 scikit-learn
-lxml
-numpy
-torch
-torchvision
-torchaudio
+xgboost
+tensorflow
+joblib
+
