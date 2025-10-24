@@ -1,35 +1,36 @@
-# analyseur_hippique_pro_auto.py
+# analyseur_hippique_final.py
 # -*- coding: utf-8 -*-
 """
-Analyseur Hippique PRO — version autonome & robuste
-- Auto-entraînement incrémental (fusion historique)
-- Modèle hybride: Deep Learning (Keras) + XGBoost (ensemble)
-- Cross-validation (simple) pour ML, EarlyStopping pour DL
-- Génération e-trio pondérée par probabilités, filtrage des combinaisons
-- Simulation de gains, journalisation (logs/training_log.csv, data/historique.csv)
+Analyseur Hippique Final — Scraper Geny robuste + Auto DL (hybride) + Streamlit UI
 """
-import os
-import re
-from datetime import datetime
-import json
-import math
 
+import os, re, math, json, warnings
+from datetime import datetime
+from itertools import combinations
 import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
 import requests
 from bs4 import BeautifulSoup
-from itertools import combinations
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import KFold, train_test_split
-from sklearn.metrics import mean_squared_error
-import xgboost as xgb
-import tensorflow as tf
-from tensorflow.keras import Sequential, callbacks
-from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
 
-# --- Directories & Paths ---
+warnings.filterwarnings("ignore")
+
+# try imports for ML/DL
+try:
+    import xgboost as xgb
+except Exception:
+    xgb = None
+try:
+    import tensorflow as tf
+    from tensorflow.keras import Sequential, callbacks
+    from tensorflow.keras.layers import Dense, Dropout, BatchNormalization
+except Exception:
+    tf = None
+
+from sklearn.preprocessing import StandardScaler
+
+# ------------------- Paths -------------------
 os.makedirs("models", exist_ok=True)
 os.makedirs("data", exist_ok=True)
 os.makedirs("logs", exist_ok=True)
@@ -39,137 +40,247 @@ DL_MODEL_PATH = os.path.join("models", "dl_model.keras")
 SCALER_PATH = os.path.join("models", "scaler.joblib")
 XGB_PATH = os.path.join("models", "xgb_model.joblib")
 TRAIN_LOG = os.path.join("logs", "training_log.csv")
-PERF_LOG = os.path.join("logs", "performance_log.csv")
 
-# --- Utilities ---
+# ------------------- Utilities -------------------
 def safe_float(x, default=np.nan):
     try:
         if pd.isna(x): return default
-        s = str(x).strip().replace(",", ".")
-        return float(re.findall(r"-?\\d+(?:\\.\\d+)?", s)[0])
+        s = str(x).strip().replace("\xa0", "").replace(",", ".")
+        m = re.search(r"-?\d+(?:\.\d+)?", s)
+        return float(m.group(0)) if m else default
     except Exception:
         return default
 
 def extract_weight(s):
     try:
         if pd.isna(s): return 60.0
-        m = re.search(r"(\\d+(?:[.,]\\d+)?)", str(s))
+        m = re.search(r"(\d+(?:[.,]\d+)?)", str(s))
         return float(m.group(1).replace(",", ".")) if m else 60.0
     except:
         return 60.0
 
-# --- Scraper simple (table-based) ---
-@st.cache_data(ttl=300)
-def scrape_race_data(url):
-    try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=12)
-        if r.status_code != 200: return None, f"HTTP {r.status_code}"
-        soup = BeautifulSoup(r.content, "html.parser")
-        table = soup.find("table")
-        if not table: return None, "Aucun tableau trouvé"
-        rows = table.find_all("tr")[1:]
-        data=[]
-        for row in rows:
-            cols = [c.get_text(strip=True) for c in row.find_all(["td","th"])]
-            if len(cols) < 3: continue
-            # best-effort mapping (user CSV preferred)
-            data.append({
-                "Numéro de corde": cols[0] if len(cols)>0 else "",
-                "Nom": cols[1] if len(cols)>1 else "",
-                "Musique": cols[2] if len(cols)>2 else "",
-                "Poids": cols[-2] if len(cols)>3 else "60",
-                "Cote": cols[-1]
-            })
-        if not data: return None, "Aucune donnée extraite"
-        return pd.DataFrame(data), "Succès"
-    except Exception as e:
-        return None, f"Erreur: {e}"
+def clean_text(s):
+    if pd.isna(s): return ""
+    return re.sub(r"\s+", " ", str(s)).strip()
 
-# --- Feature engineering (robuste) ---
+# ------------------- Robust scraper for Geny (and generic table) -------------------
+def scrape_geny_course(url, timeout=12):
+    """
+    Scrape a race page (Geny-like). Returns pandas DataFrame with columns:
+    Nom, Numéro de corde, Cote, Poids, Musique, Âge/Sexe, Jockey, Entraîneur, Gains
+    """
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    r = requests.get(url, headers=headers, timeout=timeout)
+    # Geny pages often encoded ISO-8859-1
+    if r.encoding is None or "utf" not in r.encoding.lower():
+        r.encoding = "ISO-8859-1"
+    soup = BeautifulSoup(r.text, "lxml")
+
+    # Heuristics: find table with header containing 'Cheval' or 'Musique' or 'Gains'
+    candidate_tables = soup.find_all("table")
+    table = None
+    for t in candidate_tables:
+        ths = [th.get_text(strip=True).lower() for th in t.find_all(["th","td"])[:20]]
+        joined = " ".join(ths)
+        if any(k in joined for k in ["musique", "gains", "cheval", "rapports", "driver", "entraîneur", "entraineur"]):
+            table = t
+            break
+    if table is None:
+        # fallback to first table
+        table = candidate_tables[0] if candidate_tables else None
+    if table is None:
+        raise ValueError("Aucun tableau trouvé sur la page")
+
+    rows = []
+    for tr in table.find_all("tr"):
+        tds = tr.find_all(["td", "th"])
+        if not tds:
+            continue
+        texts = [td.get_text(" ", strip=True) for td in tds]
+        if len(texts) < 3:
+            continue
+        # Heuristic mapping: try to detect common patterns
+        # We'll try to map fields by typical Geny column order:
+        # Num | Cheval | SA/Dist | Driver | Entraineur | Musique | Gains | Rapports...
+        # But pages vary — so use content-based extraction.
+        row = {
+            "Nom": "",
+            "Numéro de corde": "",
+            "Cote": "",
+            "Poids": "",
+            "Musique": "",
+            "Âge/Sexe": "",
+            "Jockey": "",
+            "Entraîneur": "",
+            "Gains": ""
+        }
+        # try to find a token that looks like a cote (contains ',' or '.') or digits
+        cote_candidate = None
+        gains_candidate = None
+        musique_candidate = None
+        # search within texts for music pattern (digits with a/A etc.)
+        for t in texts:
+            if re.search(r"\d+[a-zA-Z]\d+", t.replace(" ", "")):
+                musique_candidate = t
+            if re.search(r"\d+(\,\d+)?\s*$", t):  # ending with number -> maybe gains/cote
+                # decide by size: if > 50 it's likely gains (like 129 180) otherwise cote
+                raw_digits = re.sub(r"[^\d]", "", t)
+                try:
+                    val = int(raw_digits) if raw_digits else 0
+                    if val > 1000:  # gains
+                        gains_candidate = t
+                    else:
+                        # could be cote with comma
+                        if "," in t or "." in t:
+                            cote_candidate = t
+                except:
+                    pass
+        # fallback mapping by positions for typical table lengths
+        L = len(texts)
+        try:
+            if L >= 8:
+                row["Numéro de corde"] = texts[0]
+                row["Nom"] = texts[1]
+                # look for jockey/driver in columns
+                # try to pick columns that look like names (contain letters and spaces)
+                row["Musique"] = musique_candidate or texts[5] if L>5 else ""
+                # Gains often near the end
+                row["Gains"] = gains_candidate or texts[-2] if L>1 else ""
+                # Cote often last col
+                row["Cote"] = cote_candidate or texts[-1]
+            else:
+                # short table — assume [num, name, musique, cote]
+                row["Numéro de corde"] = texts[0]
+                row["Nom"] = texts[1]
+                if L > 2:
+                    row["Musique"] = musique_candidate or texts[2]
+                if L > 3:
+                    row["Cote"] = cote_candidate or texts[-1]
+        except Exception:
+            # best effort
+            row["Nom"] = texts[0]
+            if L>1:
+                row["Cote"] = texts[-1]
+        # cleanup
+        row = {k: clean_text(v) for k,v in row.items()}
+        # attempt to clean Cote and Gains numeric
+        # Cote examples: "13,9" or "13.9" or "—" or ""
+        if row.get("Cote"):
+            c = row["Cote"].replace(",", ".").strip()
+            m = re.search(r"\d+(\.\d+)?", c)
+            if m:
+                row["Cote"] = float(m.group(0))
+            else:
+                row["Cote"] = np.nan
+        else:
+            row["Cote"] = np.nan
+        # Gains: remove non-digit
+        if row.get("Gains"):
+            g = re.sub(r"[^\d]", "", row["Gains"])
+            try:
+                row["Gains"] = int(g) if g else 0
+            except:
+                row["Gains"] = 0
+        else:
+            row["Gains"] = 0
+        rows.append(row)
+
+    if not rows:
+        raise ValueError("Aucune ligne extraite du tableau")
+
+    df = pd.DataFrame(rows)
+
+    # ensure key columns exist
+    if "Numéro de corde" not in df.columns:
+        df["Numéro de corde"] = range(1, len(df)+1)
+    # ensure name normalization
+    df["Nom"] = df["Nom"].apply(lambda s: re.sub(r"[^\w\s'\-À-ÿ]", "", str(s)))
+    # fill missing columns with defaults
+    for col in ["Poids", "Âge/Sexe", "Jockey", "Entraîneur", "Musique"]:
+        if col not in df.columns:
+            df[col] = ""
+    # fallback Cote numeric
+    df["Cote"] = df["Cote"].apply(lambda x: np.nan if pd.isna(x) else safe_float(x, default=np.nan))
+    df["Cote"] = df["Cote"].fillna(999)  # sentinel for missing cote
+    # Poids -> try extract numbers if present
+    df["Poids"] = df["Poids"].apply(lambda x: extract_weight(x) if x else 60.0)
+    return df[["Nom","Numéro de corde","Cote","Poids","Musique","Âge/Sexe","Jockey","Entraîneur","Gains"]]
+
+# ------------------- Feature engineering -------------------
 def music_to_features(music):
     s = str(music)
-    digits = [int(x) for x in re.findall(r"\\d+", s)]
+    digits = [int(x) for x in re.findall(r"\d+", s)]
     if not digits:
-        return {"recent_wins":0, "recent_top3":0, "weighted":0.0}
+        return 0, 0, 0.0
     recent_wins = sum(1 for d in digits if d==1)
     recent_top3 = sum(1 for d in digits if d<=3)
     weights = np.linspace(1.0, 0.3, num=len(digits))
     weighted = sum((4 - d) * w for d,w in zip(digits, weights)) / (len(digits)+1e-6)
-    return {"recent_wins":recent_wins, "recent_top3":recent_top3, "weighted":weighted}
+    return recent_wins, recent_top3, weighted
 
 def prepare_data(df):
     df = df.copy()
-    # unify columns presence
-    for col in ["Cote","Numéro de corde","Poids","Musique","Âge/Sexe","Nom"]:
-        if col not in df.columns:
-            df[col] = ""
-    df["odds_numeric"] = df["Cote"].apply(lambda x: safe_float(x, default=np.nan)).fillna(999.0)
+    # normalize expected columns
+    for c in ["Nom","Numéro de corde","Cote","Poids","Musique","Âge/Sexe","Jockey","Entraîneur","Gains"]:
+        if c not in df.columns:
+            df[c] = ""
+    df["odds_numeric"] = df["Cote"].apply(lambda x: safe_float(x, default=999)).fillna(999)
     df["draw_numeric"] = df["Numéro de corde"].apply(lambda x: safe_float(x, default=1)).fillna(1).astype(int)
-    df["weight_kg"] = df["Poids"].apply(extract_weight)
-    ages=[]
-    is_female=[]
-    rw=[]; rt3=[]; rwght=[]
+    df["weight_kg"] = df["Poids"].apply(lambda x: extract_weight(x) if x!="" else 60.0)
+    ages=[]; is_f=[]; rw=[]; r3=[]; rwght=[]
     for a in df.get("Âge/Sexe", [""]*len(df)):
-        m = re.search(r"(\\d+)", str(a))
+        m = re.search(r"(\d+)", str(a))
         ages.append(float(m.group(1)) if m else 4.0)
         s = str(a).upper()
-        is_female.append(1 if "F" in s else 0)
+        is_f.append(1 if "F" in s else 0)
     for m in df.get("Musique", [""]*len(df)):
-        feat = music_to_features(m)
-        rw.append(feat["recent_wins"]); rt3.append(feat["recent_top3"]); rwght.append(feat["weighted"])
+        a,b,c = music_to_features(m)
+        rw.append(a); r3.append(b); rwght.append(c)
     df["age"] = ages
-    df["is_female"] = is_female
+    df["is_female"] = is_f
     df["recent_wins"] = rw
-    df["recent_top3"] = rt3
+    df["recent_top3"] = r3
     df["recent_weighted"] = rwght
-    # optional jockey/entraîneur features if present (pass-through)
-    if "Jockey" not in df.columns: df["Jockey"] = ""
-    if "Entraineur" not in df.columns: df["Entraineur"] = ""
-    # keep only valid odds
     df = df[df["odds_numeric"] > 0]
     df = df.reset_index(drop=True)
     return df
 
-# --- History management (fusion automatique) ---
-def append_to_historique(df_new):
-    """
-    Append new raw race dataframe to historique.csv.
-    We keep raw columns so we can re-extract features later.
-    """
-    try:
-        df_copy = df_new.copy()
-        df_copy["source_ts"] = datetime.now().isoformat()
-        if os.path.exists(HIST_PATH):
+# ------------------- History management -------------------
+def append_to_historique(raw_df):
+    df_copy = raw_df.copy()
+    df_copy["_source_ts"] = datetime.now().isoformat()
+    if os.path.exists(HIST_PATH):
+        try:
             old = pd.read_csv(HIST_PATH)
             combined = pd.concat([old, df_copy], ignore_index=True)
-        else:
+        except Exception:
             combined = df_copy
-        combined.to_csv(HIST_PATH, index=False)
-        return True, len(combined)
-    except Exception as e:
-        return False, str(e)
+    else:
+        combined = df_copy
+    combined.to_csv(HIST_PATH, index=False)
+    return len(combined)
 
-# --- Model manager Hybrid (DL + XGBoost) ---
+# ------------------- Hybrid model manager -------------------
 class HybridModel:
     def __init__(self, feature_cols=None):
         self.feature_cols = feature_cols or ["odds_numeric","draw_numeric","weight_kg","age","is_female","recent_wins","recent_top3","recent_weighted"]
         self.scaler = StandardScaler()
         self.dl_model = None
         self.xgb_model = None
-        self.loaded = False
-        # try load persisted
-        if os.path.exists(DL_MODEL_PATH) and os.path.exists(SCALER_PATH):
-            try:
+        # load if exists
+        try:
+            if tf is not None and os.path.exists(DL_MODEL_PATH):
                 self.dl_model = tf.keras.models.load_model(DL_MODEL_PATH)
+            if os.path.exists(SCALER_PATH):
                 self.scaler = joblib.load(SCALER_PATH)
-                if os.path.exists(XGB_PATH):
-                    self.xgb_model = joblib.load(XGB_PATH)
-                self.loaded = True
-            except Exception as e:
-                st.warning(f"Chargement modèles: {e}")
+            if xgb is not None and os.path.exists(XGB_PATH):
+                self.xgb_model = joblib.load(XGB_PATH)
+        except Exception as e:
+            st.warning(f"Chargement modèle existant échoué: {e}")
 
     def build_dl(self, input_dim):
+        if tf is None:
+            return None
         m = Sequential([
             Dense(128, activation="relu", input_shape=(input_dim,)),
             BatchNormalization(),
@@ -181,334 +292,275 @@ class HybridModel:
         m.compile(optimizer="adam", loss="mse")
         return m
 
-    def train(self, X, y, dl_epochs=20, dl_batch=8, xgb_rounds=100, val_split=0.15, use_cv=False):
-        """
-        Train DL and XGB on X,y (numpy arrays or pd.DataFrame/Series).
-        If historique is available with many rows, we can do CV for xgb.
-        """
-        # X may be numpy or df
+    def train(self, X, y, dl_epochs=16, dl_batch=8, xgb_rounds=100, val_split=0.15, use_cv=False):
         X_np = X.values if hasattr(X, "values") else np.array(X)
         y_np = y.values if hasattr(y, "values") else np.array(y)
-        # scale
+        # fit scaler
         Xs = self.scaler.fit_transform(X_np)
         # DL
-        if self.dl_model is None:
-            self.dl_model = self.build_dl(Xs.shape[1])
-        es = callbacks.EarlyStopping(patience=6, restore_best_weights=True)
-        history = self.dl_model.fit(Xs, y_np, validation_split=val_split, epochs=dl_epochs, batch_size=dl_batch, callbacks=[es], verbose=0)
-        # XGBoost training with basic CV if requested
-        try:
-            if use_cv and len(Xs) >= 50:
-                # quick CV to choose rounds
-                dtrain = xgb.DMatrix(Xs, label=y_np)
-                params = {"objective":"reg:squarederror","learning_rate":0.05, "max_depth":4, "eval_metric":"rmse"}
-                cvres = xgb.cv(params, dtrain, num_boost_round=xgb_rounds, nfold=4, early_stopping_rounds=10, verbose_eval=False)
-                best_rounds = len(cvres)
-            else:
-                best_rounds = max(10, min(200, xgb_rounds))
-            self.xgb_model = xgb.XGBRegressor(n_estimators=best_rounds, learning_rate=0.05, max_depth=4, random_state=42)
-            self.xgb_model.fit(Xs, y_np, verbose=False)
-        except Exception as e:
-            st.warning(f"Erreur XGBoost training: {e}")
-            self.xgb_model = None
-        # persist
-        try:
-            self.dl_model.save(DL_MODEL_PATH, overwrite=True)
-            joblib.dump(self.scaler, SCALER_PATH)
-            if self.xgb_model is not None:
+        hist = None
+        if tf is not None:
+            if self.dl_model is None:
+                self.dl_model = self.build_dl(Xs.shape[1])
+            es = callbacks.EarlyStopping(patience=6, restore_best_weights=True)
+            hist = self.dl_model.fit(Xs, y_np, validation_split=val_split, epochs=dl_epochs, batch_size=dl_batch, callbacks=[es], verbose=0)
+            try:
+                self.dl_model.save(DL_MODEL_PATH, overwrite=True)
+            except Exception as e:
+                st.warning(f"Impossible sauvegarder modèle DL: {e}")
+        # XGBoost
+        if xgb is not None:
+            try:
+                if use_cv and len(Xs) >= 50:
+                    dtrain = xgb.DMatrix(Xs, label=y_np)
+                    params = {"objective":"reg:squarederror","learning_rate":0.05,"max_depth":4}
+                    cvres = xgb.cv(params, dtrain, num_boost_round=xgb_rounds, nfold=4, early_stopping_rounds=10, verbose_eval=False)
+                    best_rounds = len(cvres)
+                else:
+                    best_rounds = max(10, min(200, xgb_rounds))
+                self.xgb_model = xgb.XGBRegressor(n_estimators=best_rounds, learning_rate=0.05, max_depth=4, random_state=42)
+                self.xgb_model.fit(Xs, y_np, verbose=False)
                 joblib.dump(self.xgb_model, XGB_PATH)
+            except Exception as e:
+                st.warning(f"Erreur entraînement XGBoost: {e}")
+                self.xgb_model = None
+        # persist scaler
+        try:
+            joblib.dump(self.scaler, SCALER_PATH)
         except Exception as e:
-            st.warning(f"Erreur sauvegarde modèles: {e}")
-        # log training summary
-        loss = history.history.get("loss", [None])[-1]
+            st.warning(f"Erreur sauvegarde scaler: {e}")
+        # log
+        loss = None
+        if hist is not None:
+            loss = hist.history.get("loss", [None])[-1]
         with open(TRAIN_LOG, "a") as f:
-            f.write(f"{datetime.now().isoformat()},{len(Xs)},{loss},{DL_MODEL_PATH}\\n")
-        return history.history
+            f.write(f"{datetime.now().isoformat()},{len(Xs)},{loss},{DL_MODEL_PATH}\n")
+        return hist.history if hist is not None else None
 
     def predict(self, X_df):
-        """
-        Returns:
-            preds_ensemble, preds_dl, preds_xgb
-        """
-        if len(X_df)==0:
+        if len(X_df) == 0:
             return np.array([]), np.array([]), np.array([])
         X_np = X_df.values if hasattr(X_df, "values") else np.array(X_df)
         Xs = self.scaler.transform(X_np)
-        preds_dl = self.dl_model.predict(Xs).flatten() if self.dl_model is not None else np.zeros(len(Xs))
-        preds_xgb = self.xgb_model.predict(Xs) if self.xgb_model is not None else np.zeros(len(Xs))
-        # normalize each
+        dl_preds = np.zeros(len(Xs))
+        xgb_preds = np.zeros(len(Xs))
+        if self.dl_model is not None and tf is not None:
+            try:
+                dl_preds = self.dl_model.predict(Xs).flatten()
+            except Exception:
+                dl_preds = np.zeros(len(Xs))
+        if self.xgb_model is not None:
+            try:
+                xgb_preds = self.xgb_model.predict(Xs)
+            except Exception:
+                xgb_preds = np.zeros(len(Xs))
+        # normalize
         def norm(a):
             a = np.array(a, dtype=float)
             if a.max() != a.min():
                 return (a - a.min())/(a.max()-a.min())
             return np.zeros_like(a)
-        ndl = norm(preds_dl)
-        nx = norm(preds_xgb)
-        # ensemble: weighted average (DL 60% XGB 40%)
-        if self.xgb_model is not None:
-            ensemble = 0.6*ndl + 0.4*nx
-        else:
-            ensemble = ndl
+        ndl = norm(dl_preds) if dl_preds.size else np.zeros(len(Xs))
+        nx = norm(xgb_preds) if xgb_preds.size else np.zeros(len(Xs))
+        ensemble = 0.6*ndl + 0.4*nx if (nx.size and ndl.size) else (ndl if ndl.size else nx)
         return ensemble, ndl, nx
 
-# --- Scoring helpers & confidence ---
-def compute_confidence(dl_preds, xgb_preds):
-    # confidence based on agreement (low std -> high confidence)
-    arr = np.vstack([dl_preds, xgb_preds]) if len(xgb_preds)>0 else np.vstack([dl_preds])
+# ------------------- Helpers: combos, confidence -------------------
+def compute_confidence(a, b):
+    if a.size==0:
+        return np.zeros_like(b)
+    if b.size==0:
+        return np.ones_like(a)
+    arr = np.vstack([a, b])
     std = np.std(arr, axis=0)
-    # map std -> confidence in (0..1) inverted
     conf = 1.0 - (std / (std.max()+1e-9))
-    conf = np.clip(conf, 0.0, 1.0)
-    return conf
+    return np.clip(conf, 0.0, 1.0)
 
-# --- Combination generator weighted + filters ---
-def generate_weighted_trios(df_ranked, n=35, max_total_odds=100.0, avoid_same_trainer=True):
-    """
-    - df_ranked: dataframe with 'Nom','score_final','Cote','Entraineur' (optional)
-    - generate n distinct combos weighted by score_final probabilities
-    - apply filters: remove combos with sum of cotes too large, or same trainer repeated
-    """
+def generate_weighted_trios(df_ranked, n=35, max_total_odds=120.0, avoid_same_trainer=True):
     names = df_ranked["Nom"].tolist()
+    if len(names) < 3:
+        return []
     scores = df_ranked["score_final"].values
-    # ensure positive
-    scores = np.maximum(scores, 1e-6)
+    scores = np.maximum(scores, 1e-9)
     probs = scores / scores.sum()
-    combos_set = set()
-    results=[]
-    attempts=0
-    max_attempts = max(10000, n*200)
+    combos_set = set(); results=[]
+    attempts = 0; max_attempts = max(2000, n*200)
     while len(results) < n and attempts < max_attempts:
         attempts += 1
-        chosen = np.random.choice(names, size=3, replace=False, p=probs)
+        chosen = list(np.random.choice(names, size=3, replace=False, p=probs))
         key = tuple(sorted(chosen))
-        if key in combos_set: 
-            continue
-        # filters
+        if key in combos_set: continue
         sub = df_ranked[df_ranked["Nom"].isin(chosen)]
-        # total odds check
         try:
             total_odds = sub["odds_numeric"].astype(float).sum()
-            if total_odds > max_total_odds: 
-                continue
+            if total_odds > max_total_odds: continue
         except:
             pass
-        # same trainer filter
-        if avoid_same_trainer and "Entraineur" in sub.columns:
-            trainers = sub["Entraineur"].fillna("").tolist()
-            if len(set(trainers)) < len(trainers):
-                continue
-        combos_set.add(key)
-        results.append(tuple(chosen))
+        if avoid_same_trainer and "Entraîneur" in df_ranked.columns:
+            trainers = sub.get("Entraîneur", pd.Series([""]*len(sub))).astype(str).tolist()
+            if len(set(trainers)) < len(trainers): continue
+        combos_set.add(key); results.append(tuple(chosen))
     return results
 
-# --- Simulation: simple backtest by applying combinations to historical results (if available) ---
-def simulate_simple_returns(historique_df, combos_list, bet_amount=1.0, payoff_multiplier=lambda odds: 1/odds):
-    """
-    Very simple simulator: for each historic race, check if any combo matches the real top3 (if we have placements).
-    This function expects historique_df to contain results (columns 'placement' or 'rank' or 'ResultTop3' etc.)
-    Because historical structure is inconsistent, this simulator will only run if we detect 'placement' column.
-    """
-    # This is a placeholder to encourage storing actual results in historique.
-    # Real simulation requires consistent labels (e.g. final positions).
-    return {"simulated_return": 0.0, "notes": "Simulation requires labelled historical results (placements)."}
-
-# --- Streamlit App UI & flow ---
-st.set_page_config(page_title="🏇 Analyseur Hippique PRO", page_icon="🏇", layout="wide")
-st.title("🏇 Analyseur Hippique PRO — Auto DL + Ensemble")
+# ------------------- Streamlit App -------------------
+st.set_page_config(page_title="🏇 Analyseur Hippique Final", layout="wide", page_icon="🏇")
+st.title("🏇 Analyseur Hippique — Scraper Geny + Auto-Training Hybride")
 
 with st.sidebar:
-    st.header("⚙️ Configuration")
-    auto_dl = st.checkbox("Activer Auto DL & Auto-train", value=True)
-    dl_epochs = st.number_input("DL epochs (per auto-train)", min_value=2, max_value=500, value=16, step=2)
-    dl_batch = st.number_input("DL batch size", min_value=2, max_value=64, value=8, step=1)
-    use_cv = st.checkbox("Utiliser CV pour XGBoost (si historique >= 50)", value=True)
-    ml_confidence = st.slider("Poids ML/DL dans mélange final (0=heuristique seul, 1=modèles)", 0.0, 1.0, 0.6, 0.05)
+    st.header("Configuration")
+    use_scraper = st.checkbox("Utiliser scraper Geny automatique (URL)", value=True)
+    auto_train = st.checkbox("Auto Train (historique)", value=True)
+    dl_epochs = st.number_input("DL epochs", min_value=2, max_value=400, value=16, step=2)
+    dl_batch = st.number_input("DL batch", min_value=2, max_value=64, value=8, step=1)
+    use_cv = st.checkbox("Use XGBoost CV if historique large", value=True)
+    blend_weight = st.slider("Poids modèles (1=100% modèles, 0=heuristique)", 0.0, 1.0, 0.6)
     n_combos = st.number_input("Nb combinaisons e-trio", min_value=5, max_value=200, value=35, step=1)
     st.markdown("---")
-    st.info("L'app fusionne automatiquement les nouveaux CSV/URLs dans data/historique.csv et réentraîne les modèles si auto DL est activé.")
+    st.info("Le script fusionne les imports dans data/historique.csv et entraînera les modèles si 'Auto Train' est activé.")
 
-tab1, tab2, tab3 = st.tabs(["🌐 URL Analysis","📁 Upload CSV","🧪 Test Data / Historique"])
+tab1, tab2, tab3 = st.tabs(["URL / Scraper", "Upload CSV", "Historique & Tests"])
+
 df_race = None
-
 with tab1:
-    st.subheader("🔍 Analyse d'URL de course")
-    url = st.text_input("URL de la page course (table HTML)")
-    if st.button("Analyser URL"):
+    st.subheader("Scraper URL")
+    url = st.text_input("URL de la page course (Geny ou tableau HTML)")
+    if st.button("Scraper / Charger"):
         if not url:
-            st.error("Fournis une URL")
+            st.error("Fourni une URL")
         else:
-            df_tmp, msg = scrape_race_data(url)
-            if df_tmp is None:
-                st.error(f"Erreur: {msg}")
-            else:
-                st.success(f"✅ {len(df_tmp)} chevaux extraits")
-                st.dataframe(df_tmp.head())
-                df_race = df_tmp
+            try:
+                df_race = scrape_geny_course(url)
+                st.success(f"Extraction OK ({len(df_race)} lignes)")
+                st.dataframe(df_race.head(30))
+            except Exception as e:
+                st.error(f"Erreur scraping: {e}")
 
 with tab2:
-    st.subheader("📤 Upload CSV (nouvelle course ou lot de courses)")
-    uploaded = st.file_uploader("Fichier CSV (colonnes attendues: Nom, Numéro de corde, Cote, Poids, Musique, Âge/Sexe, optional: Jockey, Entraineur)", type=["csv"])
+    st.subheader("Upload CSV (nouvelle course)")
+    uploaded = st.file_uploader("CSV (colonnes attendues: Nom, Numéro de corde, Cote, Poids, Musique, Âge/Sexe, optional: Jockey, Entraîneur, Gains)", type=["csv"])
     if uploaded:
         try:
             df_race = pd.read_csv(uploaded)
-            st.success(f"✅ {len(df_race)} lignes chargées")
+            st.success(f"Fichier chargé ({len(df_race)} lignes)")
             st.dataframe(df_race.head())
         except Exception as e:
             st.error(f"Erreur lecture CSV: {e}")
 
 with tab3:
-    st.subheader("🧪 Données de test & Historique")
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Charger sample plat"):
-            df_race = pd.DataFrame({
-                "Nom": ["Thunder","Lightning","Storm","Rain","Wind"],
-                "Numéro de corde": ["1","2","3","4","5"],
-                "Cote": ["3.2","4.8","7.5","6.2","9.1"],
-                "Poids": ["56.5","57","58.5","59","57.5"],
-                "Musique": ["1a2a3a","2a1a4a","3a3a1a","1a4a2a","4a2a5a"],
-                "Âge/Sexe": ["4H","5M","3F","6H","4M"]
-            })
-            st.success("Sample chargé")
-            st.dataframe(df_race)
-    with col2:
-        if st.button("Afficher historique (si existe)"):
-            if os.path.exists(HIST_PATH):
-                hist = pd.read_csv(HIST_PATH)
-                st.write(f"Historique {len(hist)} lignes")
-                st.dataframe(hist.tail(50))
-            else:
-                st.info("Aucun historique trouvé")
+    st.subheader("Historique & Tests")
+    if st.button("Afficher historique (dernieres 50 lignes)"):
+        if os.path.exists(HIST_PATH):
+            hist = pd.read_csv(HIST_PATH)
+            st.write(f"Historique total: {len(hist)} lignes")
+            st.dataframe(hist.tail(50))
+        else:
+            st.info("Aucun historique trouvé")
+    if st.button("Supprimer historique"):
+        if os.path.exists(HIST_PATH):
+            os.remove(HIST_PATH); st.success("Historique supprimé")
+        else:
+            st.info("Aucun historique à supprimer")
 
-# --- Main pipeline ---
-if df_race is not None and len(df_race)>0:
+# Main pipeline
+if df_race is not None and len(df_race) > 0:
     st.markdown("---")
-    st.header("🔎 Préparation & Auto-entraînement")
-    st.write("Extraction des features...")
-    df_prepared = prepare_data(df_race)
-    st.dataframe(df_prepared[["Nom","Cote","odds_numeric","draw_numeric","weight_kg","recent_wins","recent_top3","recent_weighted"]].assign(score=lambda d: (1/(d["odds_numeric"]+0.1)).round(3)))
+    st.header("Préparation & Entraînement")
+    df_prep = prepare_data(df_race)
+    st.dataframe(df_prep[["Nom","Cote","odds_numeric","draw_numeric","weight_kg","recent_wins","recent_top3","recent_weighted"]].assign(heuristic=lambda d: (1/(d["odds_numeric"]+0.1)).round(3)))
+
     # append to historique
-    ok, info = append_to_historique(df_race)
-    if ok:
-        st.success(f"Historique mis à jour ({info} lignes totales).")
-    else:
-        st.warning(f"Historique NON mis à jour: {info}")
+    total = append_to_historique(df_race)
+    st.success(f"Historique mis à jour — total lignes: {total}")
 
-    # instantiate hybrid model manager
+    # build model manager
     feats = ["odds_numeric","draw_numeric","weight_kg","age","is_female","recent_wins","recent_top3","recent_weighted"]
-    model = HybridModel(feature_cols=feats)
+    manager = HybridModel(feature_cols=feats)
 
-    # prepare X/y from historique if available
-    X_hist, y_hist = None, None
+    # prepare X/y from historique (preferred) or pseudo-target
+    X_hist = None; y_hist = None
     if os.path.exists(HIST_PATH):
         try:
-            hist_df = pd.read_csv(HIST_PATH)
-            hist_prep = prepare_data(hist_df)
-            # only include races that have 'placement' or 'rank' if possible
-            if "placement" in hist_df.columns or "rank" in hist_df.columns:
-                if "placement" in hist_df.columns:
-                    y_hist = 1.0/(hist_prep["placement"].astype(float) + 0.1)
+            hist_raw = pd.read_csv(HIST_PATH)
+            hist_prep = prepare_data(hist_raw)
+            if "placement" in hist_raw.columns or "rank" in hist_raw.columns:
+                if "placement" in hist_raw.columns:
+                    y_hist = 1.0 / (hist_prep["placement"].astype(float) + 0.1)
                 else:
-                    y_hist = 1.0/(hist_prep["rank"].astype(float) + 0.1)
+                    y_hist = 1.0 / (hist_prep["rank"].astype(float) + 0.1)
                 X_hist = hist_prep[feats]
             else:
-                # pseudo-target fallback
+                # pseudo target
                 y_hist = 0.7*(1.0/(hist_prep["odds_numeric"]+0.1)) + 0.3*(hist_prep["recent_weighted"]/(hist_prep["recent_weighted"].max()+1e-6))
                 X_hist = hist_prep[feats]
         except Exception as e:
-            st.warning(f"Erreur lecture historique pour training: {e}")
+            st.warning(f"Erreur lecture historique: {e}")
 
-    # Auto-train if enabled (prefer full historique)
     trained = False
-    if auto_dl:
+    if auto_train:
         try:
             if X_hist is not None and len(X_hist) >= 4:
-                st.info(f"Entrainement automatique sur historique ({len(X_hist)} échantillons)...")
-                hist = model.train(X_hist, y_hist, dl_epochs=dl_epochs, dl_batch=dl_batch, use_cv=use_cv)
+                st.info(f"Entraînement automatique sur historique ({len(X_hist)} échantillons)...")
+                manager.train(X_hist, y_hist, dl_epochs=dl_epochs, dl_batch=dl_batch, use_cv=use_cv)
                 trained = True
             else:
-                # train on current race only (pseudo-target)
-                if len(df_prepared) >= 3:
-                    y_curr = 0.7*(1.0/(df_prepared["odds_numeric"]+0.1)) + 0.3*(df_prepared["recent_weighted"]/(df_prepared["recent_weighted"].max()+1e-6))
-                    st.info("Peu de données historiques: entraînement sur la course actuelle (pseudo-target).")
-                    hist = model.train(df_prepared[feats], y_curr, dl_epochs=max(4,dl_epochs//2), dl_batch=dl_batch, use_cv=False)
+                # fallback train on current race if possible
+                if len(df_prep) >= 3:
+                    y_curr = 0.7*(1.0/(df_prep["odds_numeric"]+0.1)) + 0.3*(df_prep["recent_weighted"]/(df_prep["recent_weighted"].max()+1e-6))
+                    st.info("Entrainement sur course courante (pseudo-target)...")
+                    manager.train(df_prep[feats], y_curr, dl_epochs=max(4,dl_epochs//2), dl_batch=dl_batch, use_cv=False)
                     trained = True
         except Exception as e:
             st.warning(f"Erreur auto-train: {e}")
 
     # predictions
-    st.info("Calcul des prédictions hybrid (DL + XGBoost)...")
-    X_curr = df_prepared[feats].fillna(0)
-    ensemble, dl_p, xgb_p = model.predict(X_curr)
-    # compute a fallback heuristic score
-    heuristic = 1.0/(df_prepared["odds_numeric"]+0.1)
+    X_curr = df_prep[feats].fillna(0)
+    ensemble, dl_norm, xgb_norm = manager.predict(X_curr)
+    heuristic = 1.0/(df_prep["odds_numeric"]+0.1)
     if heuristic.max() != heuristic.min():
         heuristic = (heuristic - heuristic.min())/(heuristic.max()-heuristic.min())
-    # blend final: (1-ml_confidence)*heuristic + ml_confidence*(ensemble)
-    final = (1 - ml_confidence) * heuristic + ml_confidence * ensemble
-    # compute confidence
-    confidence = compute_confidence(dl_p, xgb_p) if xgb_p.size>0 else np.ones_like(dl_p)
-    df_prepared["dl_norm"] = dl_p
-    df_prepared["xgb_norm"] = xgb_p if len(xgb_p)==len(dl_p) else np.zeros_like(dl_p)
-    df_prepared["score_final"] = final
-    df_prepared["confidence"] = confidence
-    df_ranked = df_prepared.sort_values("score_final", ascending=False).reset_index(drop=True)
+    final = (1 - blend_weight) * heuristic + blend_weight * ensemble
+    conf = compute_confidence(dl_norm, xgb_norm)
+    df_prep["dl_norm"] = dl_norm
+    df_prep["xgb_norm"] = xgb_norm if len(xgb_norm)==len(dl_norm) else np.zeros_like(dl_norm)
+    df_prep["score_final"] = final
+    df_prep["confidence"] = conf
+    df_ranked = df_prep.sort_values("score_final", ascending=False).reset_index(drop=True)
     df_ranked["rang"] = range(1, len(df_ranked)+1)
 
-    # Display ranking & metrics
+    # Display outputs
     left, right = st.columns([2,1])
     with left:
-        st.subheader("🏆 Classement final")
-        display_cols = ["rang","Nom","Cote","Numéro de corde","Poids","score_final","confidence"]
-        display = df_ranked[display_cols].copy()
-        display["Score"] = display["score_final"].round(3)
-        display["Conf"] = (display["confidence"]*100).round(1).astype(str) + "%"
-        display = display.drop(["score_final","confidence"], axis=1)
-        st.dataframe(display, use_container_width=True)
+        st.subheader("Classement final")
+        disp = df_ranked[["rang","Nom","Cote","Numéro de corde","weight_kg","score_final","confidence"]].copy()
+        disp["Score"] = disp["score_final"].round(3)
+        disp["Conf"] = (disp["confidence"]*100).round(1).astype(str) + "%"
+        disp = disp.drop(["score_final","confidence"], axis=1)
+        st.dataframe(disp, use_container_width=True)
     with right:
-        st.subheader("📊 Métriques & infos")
+        st.subheader("Infos")
         st.metric("Nb chevaux", len(df_ranked))
-        # show training status
-        st.markdown(f"- Auto-DL: **{'ON' if auto_dl else 'OFF'}**")
-        st.markdown(f"- Modèles chargés: DL={'Oui' if model.dl_model is not None else 'Non'}, XGB={'Oui' if model.xgb_model is not None else 'Non'}")
-        top_fav = len(df_ranked[df_ranked["odds_numeric"]<5])
-        st.markdown(f"- Favoris (<5): **{top_fav}**")
+        st.markdown(f"- Auto-train: **{'ON' if auto_train else 'OFF'}**")
+        st.markdown(f"- Modèles chargés: DL={'Oui' if (manager.dl_model is not None) else 'Non'}, XGB={'Oui' if (manager.xgb_model is not None) else 'Non'}")
         if trained:
-            st.success("✅ Auto-train effectué")
-        else:
-            st.info("ℹ️ Pas d'entraînement (données insuffisantes ou DL désactivé)")
+            st.success("Auto-train effectué")
 
-    # Visuals
-    st.subheader("📊 Visualisations")
+    st.subheader("Visualisations")
     st.bar_chart(df_ranked.set_index("Nom")["score_final"].head(12))
 
-    # Generate weighted combos with filtering
-    st.subheader("🎲 Générateur e-trio pondéré & filtré")
+    st.subheader("Générateur e-trio pondéré & filtré")
     combos = generate_weighted_trios(df_ranked, n=int(n_combos), max_total_odds=120.0, avoid_same_trainer=True)
     if combos:
         for i,c in enumerate(combos):
             st.markdown(f"{i+1}. {c[0]} — {c[1]} — {c[2]}")
     else:
-        st.info("Aucune combinaison générée (essayez d'augmenter max_total_odds ou vérifier la course).")
+        st.info("Aucune combinaison générée")
 
-    # Simple simulated return (placeholder)
-    st.subheader("📈 Simulation rapide (placeholder)")
-    sim = simulate_simple_returns(None, combos)
-    st.write(sim.get("notes"))
-
-    # Export results
-    st.subheader("💾 Export")
-    csv_data = df_ranked.to_csv(index=False)
-    st.download_button("Télécharger CSV pronostic", csv_data, f"pronostic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-    st.download_button("Télécharger JSON pronostic", df_ranked.to_json(orient="records", indent=2), f"pronostic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-
-    # Save last predictions snapshot
-    try:
-        snapshot_path = os.path.join("data", f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
-        df_ranked.to_csv(snapshot_path, index=False)
-        st.success(f"Snapshot sauvegardé: {snapshot_path}")
-    except Exception as e:
-        st.warning(f"Erreur sauvegarde snapshot: {e}")
+    st.subheader("Export & snapshot")
+    st.download_button("Télécharger pronostic CSV", df_ranked.to_csv(index=False), f"pronostic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    st.download_button("Télécharger pronostic JSON", df_ranked.to_json(orient="records", indent=2), f"pronostic_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
+    snapshot = os.path.join("data", f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    df_ranked.to_csv(snapshot, index=False)
+    st.success(f"Snapshot sauvegardé: {snapshot}")
 
 st.markdown("---")
-st.markdown("Notes: 1) Pour obtenir des pronostics réellement performants il faut un historique labellisé (placements) de plusieurs centaines à milliers de courses. 2) Je peux t'aider à ajouter l'extraction de données publiques (Geny) et pipelines ETL pour consolider l'historique automatiquement.")
+st.info("Conseils: pour de bonnes performances il faut un historique labellisé (placements). Je peux t'aider à automatiser la récupération des résultats et compléter l'historique.")
