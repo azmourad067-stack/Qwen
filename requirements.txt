@@ -3,9 +3,8 @@ pandas
 numpy
 requests
 beautifulsoup4
-plotly
+lxml
 scikit-learn
 xgboost
-tensorflow
+tensorflow==2.16.1
 joblib
-
