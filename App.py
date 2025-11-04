@@ -39,7 +39,7 @@ from sklearn.calibration import CalibratedClassifierCV, calibration_curve
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-from tensorflow.keras.wrappers.scikit_learn import KerasRegressor
+from scikeras.wrappers import KerasRegressor
 
 # --- UI config ---
 st.set_page_config(page_title="🏇 Analyseur Hippique IA Pro — v2", page_icon="🏇", layout="wide")
