@@ -1,11 +1,22 @@
-streamlit
-pandas
-numpy
-requests
-beautifulsoup4
-lxml
-scikit-learn
-xgboost
-tensorflow
-joblib
-plotly
+# --- Core Streamlit app ---
+streamlit>=1.37.0
+pandas>=2.2.0
+numpy>=1.26.0
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+plotly>=5.20.0
+
+# --- Machine Learning ---
+scikit-learn>=1.4.0
+tensorflow-cpu>=2.12.0
+# (si tu es sur PC avec GPU, tu peux remplacer tensorflow-cpu par tensorflow>=2.12.0)
+
+# --- Stats & Math ---
+scipy>=1.12.0
+
+# --- Optional but useful ---
+tqdm>=4.66.0
+joblib>=1.3.2
+
+# --- Compatibility (évite avertissements Pandas/Numpy) ---
+python-dateutil>=2.8.2
