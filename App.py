@@ -953,7 +953,7 @@ TOP 5 PRÉDICTIONS:
 """
             for i in range(min(5, len(df_ranked))):
                 horse = df_ranked.iloc[i]
-                report += f"{i+1}. {horse['Nom']} - Cote: {horse['Cote']} - Score: {horse['score_final']}
+                report += f"{i+1}. {horse['Nom']} - Cote: {horse['Cote']} - Score: {horse['score_final']:.3f}
 "
             if ml_results:
                 report += f"
