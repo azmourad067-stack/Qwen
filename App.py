@@ -942,31 +942,34 @@ def main():
             )
         with col3:
             # Export du rapport complet
-            report = f"""
-RAPPORT D'ANALYSE HIPPIQUE ML v2
-{'='*50}
-Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-Type de course: {detected_type}
-Nombre de chevaux: {len(df_ranked)}
-TOP 5 PRÉDICTIONS:
-{'-'*50}
-"""
+            report_lines = [
+                f"RAPPORT D'ANALYSE HIPPIQUE ML v2",
+                f"{'='*50}",
+                f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Type de course: {detected_type}",
+                f"Nombre de chevaux: {len(df_ranked)}",
+                f"",
+                f"TOP 5 PRÉDICTIONS:",
+                f"{'-'*50}",
+            ]
             for i in range(min(5, len(df_ranked))):
                 horse = df_ranked.iloc[i]
-                report += f"{i+1}. {horse['Nom']} - Cote: {horse['Cote']} - Score: {horse['score_final']:.3f}
-"
+                report_lines.append(f"{i+1}. {horse['Nom']} - Cote: {horse['Cote']} - Score: {horse['score_final']:.3f}")
+            
             if ml_results:
-                report += f"
-{'='*50}
-MÉTRIQUES ML:
-{'-'*50}
-"
+                report_lines.extend([
+                    f"",
+                    f"{'='*50}",
+                    f"MÉTRIQUES ML:",
+                    f"{'-'*50}",
+                ])
                 for model, scores in ml_results.items():
-                    report += f"{model}: R² = {scores['mean']:.3f} (+/- {scores['std']:.3f})
-"
+                    report_lines.append(f"{model}: R² = {scores['mean']:.3f} (+/- {scores['std']:.3f})")
+            
+            report_text = "\n".join(report_lines)
             st.download_button(
                 "📊 Télécharger Rapport",
-                report,
+                report_text,
                 f"rapport_ml_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
                 "text/plain",
                 use_container_width=True
